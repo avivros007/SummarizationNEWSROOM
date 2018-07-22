@@ -42,7 +42,7 @@ def load_ckpt(saver, sess, ckpt_dir="train"):
       time.sleep(10)
 
 def load_ckpt_size(saver, sess, ckpt_dir="train"):
-  """Load checkpoint from the ckpt_dir (if unspecified, this is train dir) and restore it to saver and sess, waiting 10 secs in the case of failure. Also returns checkpoint name."""
+  """Load size predictor checkpoint from the modelSizePrediction/ckpt_dir (if unspecified, this is train dir) and restore it to saver and sess, waiting 10 secs in the case of failure. Also returns checkpoint name."""
   while True:
     try:
       latest_filename = "checkpoint_best" if ckpt_dir=="eval" else None
