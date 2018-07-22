@@ -88,9 +88,14 @@ class SummarizationModel(object):
         Each are list of LSTMStateTuples of shape ([batch_size,hidden_dim],[batch_size,hidden_dim])
     """
     with tf.variable_scope('encoder'):
-      cell_fw = [tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True) for _ in range(self._hps.num_stacks)]
-      cell_bw = [tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True) for _ in range(self._hps.num_stacks)]
-      (encoder_outputs, fw_st, bw_st) = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(cell_fw, cell_bw, encoder_inputs, dtype=tf.float32, sequence_length=seq_len)
+      if self._hps.num_stacks > 1:
+        cell_fw = [tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True) for _ in range(self._hps.num_stacks)]
+        cell_bw = [tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True) for _ in range(self._hps.num_stacks)]
+        (encoder_outputs, fw_st, bw_st) = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(cell_fw, cell_bw, encoder_inputs, dtype=tf.float32, sequence_length=seq_len)
+      else:
+        cell_fw = tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True)
+        cell_bw = tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True)
+        (encoder_outputs, (fw_st, bw_st)) = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw, encoder_inputs, dtype=tf.float32, sequence_length=seq_len, swap_memory=True)
       encoder_outputs = tf.concat(axis=2, values=encoder_outputs) # concatenate the forwards and backwards states
     return encoder_outputs, fw_st, bw_st
 
@@ -115,8 +120,12 @@ class SummarizationModel(object):
       bias_reduce_h = tf.get_variable('bias_reduce_h', [hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
 
       # Apply linear layer
-      old_c = tf.concat(axis=1, values=[x.c for x in fw_st] + [x.c for x in bw_st]) # Concatenation of fw and bw cells
-      old_h = tf.concat(axis=1, values=[x.h for x in fw_st] + [x.h for x in bw_st]) # Concatenation of fw and bw states
+      if self._hps.num_stacks > 1:
+        old_c = tf.concat(axis=1, values=[x.c for x in fw_st] + [x.c for x in bw_st]) # Concatenation of fw and bw cells
+        old_h = tf.concat(axis=1, values=[x.h for x in fw_st] + [x.h for x in bw_st]) # Concatenation of fw and bw states
+      else:
+        old_c = tf.concat(axis=1, values=[fw_st.c, bw_st.c]) # Concatenation of fw and bw cell
+        old_h = tf.concat(axis=1, values=[fw_st.h, bw_st.h]) # Concatenation of fw and bw state
       new_c = tf.nn.relu(tf.matmul(old_c, w_reduce_c) + bias_reduce_c) # Get new cell from old cells
       new_h = tf.nn.relu(tf.matmul(old_h, w_reduce_h) + bias_reduce_h) # Get new state from old states
       return tf.contrib.rnn.LSTMStateTuple(new_c, new_h) # Return new cell and state
