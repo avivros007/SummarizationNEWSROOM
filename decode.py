@@ -35,7 +35,7 @@ SECS_UNTIL_NEW_CKPT = 60  # max number of seconds before loading new checkpoint
 class BeamSearchDecoder(object):
   """Beam search decoder."""
 
-  def __init__(self, model, batcher, vocab):
+  def __init__(self, model, batcher, vocab, sizePredictor):
     """Initialize decoder.
 
     Args:
@@ -49,9 +49,15 @@ class BeamSearchDecoder(object):
     self._vocab = vocab
     self._saver = tf.train.Saver() # we use this to load checkpoints for decoding
     self._sess = tf.Session(config=util.get_config())
-
     # Load an initial checkpoint to use for decoding
     ckpt_path = util.load_ckpt(self._saver, self._sess)
+
+    self._sizePredictor = sizePredictor
+    if self._sizePredictor is not None:
+      self._sizePredictor.build_graph()
+      self._saverSize = tf.train.Saver(var_list=tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='Sseq2seq'))
+      ckpt_path_size = util.load_ckpt_size(self._saverSize, self._sess)
+
 
     if FLAGS.single_pass:
       # Make a descriptive decode directory name
@@ -95,6 +101,10 @@ class BeamSearchDecoder(object):
       article_withunks = data.show_art_oovs(original_article, self._vocab) # string
       abstract_withunks = data.show_abs_oovs(original_abstract, self._vocab, (batch.art_oovs[0] if FLAGS.pointer_gen else None)) # string
 
+      # predict size
+      if self._sizePredictor is not None:
+        pred_length = int(self._sizePredictor.predict_size(self._sess, batch)['preds'][0][0])
+
       # Run beam search to get best Hypothesis
       best_hyp = beam_search.run_beam_search(self._sess, self._model, self._vocab, batch)
 
@@ -108,6 +118,11 @@ class BeamSearchDecoder(object):
         decoded_words = decoded_words[:fst_stop_idx]
       except ValueError:
         decoded_words = decoded_words
+      
+      # change summary length
+      if self._sizePredictor is not None:
+        decoded_words = decoded_words[:pred_length]
+
       decoded_output = ' '.join(decoded_words) # single string
 
       if FLAGS.single_pass:
