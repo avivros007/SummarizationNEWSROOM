@@ -107,15 +107,11 @@ class Vocab(object):
 
 
 def example_generator(data_path, single_pass):
-  """Generates tf.Examples from data files.
-
-    Binary data format: <length><blob>. <length> represents the byte size
-    of <blob>. <blob> is serialized tf.Example proto. The tf.Example contains
-    the tokenized article text and summary.
+  """Generates tf.Examples from NEWSROOM dataset data files.
 
   Args:
     data_path:
-      Path to tf.Example data files. Can include wildcards, e.g. if you have several training data chunk files train_001.bin, train_002.bin, etc, then pass data_path=train_* to access them all.
+      Path to NEWSROOM dataset .data file.
     single_pass:
       Boolean. If True, go through the dataset exactly once, generating examples in the order they appear, then return. Otherwise, generate random examples indefinitely.
 
