@@ -74,7 +74,8 @@ class SummarizationModel(object):
     return feed_dict
 
   def _add_encoder(self, encoder_inputs, seq_len):
-    """Add a single-layer bidirectional LSTM encoder to the graph.
+    """Add a multi-layer bidirectional LSTM encoder to the graph.
+    	the number of layers is defined by the hyperparameter num_stacks.
 
     Args:
       encoder_inputs: A tensor of shape [batch_size, <=max_enc_steps, emb_size].
@@ -84,22 +85,22 @@ class SummarizationModel(object):
       encoder_outputs:
         A tensor of shape [batch_size, <=max_enc_steps, 2*hidden_dim]. It's 2*hidden_dim because it's the concatenation of the forwards and backwards states.
       fw_state, bw_state:
-        Each are LSTMStateTuples of shape ([batch_size,hidden_dim],[batch_size,hidden_dim])
+        Each are list of LSTMStateTuples of shape ([batch_size,hidden_dim],[batch_size,hidden_dim])
     """
     with tf.variable_scope('encoder'):
-      cell_fw = tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True)
-      cell_bw = tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True)
-      (encoder_outputs, (fw_st, bw_st)) = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw, encoder_inputs, dtype=tf.float32, sequence_length=seq_len, swap_memory=True)
+      cell_fw = [tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True) for _ in range(self._hps.num_stacks)]
+      cell_bw = [tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True) for _ in range(self._hps.num_stacks)]
+      (encoder_outputs, fw_st, bw_st) = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(cell_fw, cell_bw, encoder_inputs, dtype=tf.float32, sequence_length=seq_len)
       encoder_outputs = tf.concat(axis=2, values=encoder_outputs) # concatenate the forwards and backwards states
     return encoder_outputs, fw_st, bw_st
 
 
   def _reduce_states(self, fw_st, bw_st):
-    """Add to the graph a linear layer to reduce the encoder's final FW and BW state into a single initial state for the decoder. This is needed because the encoder is bidirectional but the decoder is not.
+    """Add to the graph a linear layer to reduce the encoder's final FW and BW states into a single initial state for the decoder. This is needed because the encoder is bidirectional (and multi-layer) but the decoder is not.
 
     Args:
-      fw_st: LSTMStateTuple with hidden_dim units.
-      bw_st: LSTMStateTuple with hidden_dim units.
+      fw_st: list of LSTMStateTuples with hidden_dim units.
+      bw_st: list of LSTMStateTuples with hidden_dim units.
 
     Returns:
       state: LSTMStateTuple with hidden_dim units.
@@ -108,16 +109,16 @@ class SummarizationModel(object):
     with tf.variable_scope('reduce_final_st'):
 
       # Define weights and biases to reduce the cell and reduce the state
-      w_reduce_c = tf.get_variable('w_reduce_c', [hidden_dim * 2, hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
-      w_reduce_h = tf.get_variable('w_reduce_h', [hidden_dim * 2, hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      w_reduce_c = tf.get_variable('w_reduce_c', [hidden_dim * 2 * self._hps.num_stacks, hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      w_reduce_h = tf.get_variable('w_reduce_h', [hidden_dim * 2 * self._hps.num_stacks, hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
       bias_reduce_c = tf.get_variable('bias_reduce_c', [hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
       bias_reduce_h = tf.get_variable('bias_reduce_h', [hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
 
       # Apply linear layer
-      old_c = tf.concat(axis=1, values=[fw_st.c, bw_st.c]) # Concatenation of fw and bw cell
-      old_h = tf.concat(axis=1, values=[fw_st.h, bw_st.h]) # Concatenation of fw and bw state
-      new_c = tf.nn.relu(tf.matmul(old_c, w_reduce_c) + bias_reduce_c) # Get new cell from old cell
-      new_h = tf.nn.relu(tf.matmul(old_h, w_reduce_h) + bias_reduce_h) # Get new state from old state
+      old_c = tf.concat(axis=1, values=[x.c for x in fw_st] + [x.c for x in bw_st]) # Concatenation of fw and bw cells
+      old_h = tf.concat(axis=1, values=[x.h for x in fw_st] + [x.h for x in bw_st]) # Concatenation of fw and bw states
+      new_c = tf.nn.relu(tf.matmul(old_c, w_reduce_c) + bias_reduce_c) # Get new cell from old cells
+      new_h = tf.nn.relu(tf.matmul(old_h, w_reduce_h) + bias_reduce_h) # Get new state from old states
       return tf.contrib.rnn.LSTMStateTuple(new_c, new_h) # Return new cell and state
 
 
@@ -263,7 +264,6 @@ class SummarizationModel(object):
 
             # Apply dec_padding_mask and get loss
             self._loss = _mask_and_avg(loss_per_step, self._dec_padding_mask)
-
           else: # baseline model
             self._loss = tf.contrib.seq2seq.sequence_loss(tf.stack(vocab_scores, axis=1), self._target_batch, self._dec_padding_mask) # this applies softmax internally
 
