@@ -49,6 +49,10 @@ class SummarizationModel(object):
     self._target_batch = tf.placeholder(tf.int32, [hps.batch_size, hps.max_dec_steps], name='target_batch')
     self._dec_padding_mask = tf.placeholder(tf.float32, [hps.batch_size, hps.max_dec_steps], name='dec_padding_mask')
 
+    # disc part
+    if self._hps.gan_coeff > 0:
+      self._disc_in = tf.placeholder(tf.int32, [hps.batch_size, hps.max_dec_steps], name='disc_in')
+
     if hps.mode=="decode" and hps.coverage:
       self.prev_coverage = tf.placeholder(tf.float32, [hps.batch_size, None], name='prev_coverage')
 
@@ -71,7 +75,30 @@ class SummarizationModel(object):
       feed_dict[self._dec_batch] = batch.dec_batch
       feed_dict[self._target_batch] = batch.target_batch
       feed_dict[self._dec_padding_mask] = batch.dec_padding_mask
+    if self._hps.mode=="train" and self._hps.gan_coeff > 0:
+      feed_dict[self._disc_in] = batch.target_batch
+      for i in range(len(feed_dict[self._disc_in])):
+        for j in range(len(feed_dict[self._disc_in][i])):
+          if feed_dict[self._disc_in][i][j] >= self._vocab.size():
+            feed_dict[self._disc_in][i][j] = 0
+
     return feed_dict
+
+  def _add_disc(self, inputs, reuse):
+    with tf.variable_scope('disc') as scope:
+      if reuse:
+        scope.reuse_variables()
+      cell_fw = tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True)
+      cell_bw = tf.contrib.rnn.LSTMCell(self._hps.hidden_dim, initializer=self.rand_unif_init, state_is_tuple=True)
+      seq_lens = np.array([self._hps.max_dec_steps] * self._hps.batch_size)
+      (disc_outputs, (fw_st, bw_st)) = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw, inputs, dtype=tf.float32, swap_memory=True, sequence_length = seq_lens)
+
+      W_disc = tf.get_variable('W_disc', [self._hps.hidden_dim * 2, 1], dtype=tf.float32, initializer=self.trunc_norm_init)
+      b_disc = tf.get_variable('b_disc', [1], dtype=tf.float32, initializer=self.trunc_norm_init)
+    
+    final_st = tf.concat(axis=1, values=[fw_st.c, bw_st.c])  
+    return tf.sigmoid(tf.matmul(final_st, W_disc) + b_disc)
+
 
   def _add_encoder(self, encoder_inputs, seq_len):
     """Add a multi-layer bidirectional LSTM encoder to the graph.
@@ -254,8 +281,7 @@ class SummarizationModel(object):
       else: # final distribution is just vocabulary distribution
         final_dists = vocab_dists
 
-
-
+      
       if hps.mode in ['train', 'eval']:
         # Calculate the loss
         with tf.variable_scope('loss'):
@@ -273,6 +299,23 @@ class SummarizationModel(object):
 
             # Apply dec_padding_mask and get loss
             self._loss = _mask_and_avg(loss_per_step, self._dec_padding_mask)
+
+            # add gan losses
+            if self._hps.gan_coeff > 0:
+              with tf.variable_scope('disc_embedding'):
+                disc_embedding = tf.get_variable('disc_embedding', [vsize, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+                emb_disc_inputs = tf.nn.embedding_lookup(disc_embedding, self._disc_in)
+              disc_real = self._add_disc(emb_disc_inputs, False)
+              with tf.variable_scope('disc_fake_embedding'):
+                disc_fake_embedding = tf.get_variable('disc_fake_embedding', [vsize, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+                stacked_final_dists = tf.stack(vocab_dists, axis=1)
+                reshaped_final_dists = tf.reshape(stacked_final_dists, [self._hps.batch_size, self._hps.max_dec_steps, vsize])
+                final_dists_2d = tf.reshape(reshaped_final_dists, [-1, vsize])
+                emb_disc_fake_inputs_2d = tf.matmul(final_dists_2d, disc_fake_embedding)
+                emb_disc_fake_inputs = tf.reshape(emb_disc_fake_inputs_2d, [self._hps.batch_size, self._hps.max_dec_steps, -1])
+              disc_fake = self._add_disc(emb_disc_fake_inputs, True)
+              self._disc_loss = -tf.reduce_mean(tf.log(disc_real) + tf.log(1. - disc_fake))
+              self._loss = self._loss - self._hps.gan_coeff * tf.reduce_mean(tf.log(disc_fake))
           else: # baseline model
             self._loss = tf.contrib.seq2seq.sequence_loss(tf.stack(vocab_scores, axis=1), self._target_batch, self._dec_padding_mask) # this applies softmax internally
 
@@ -298,7 +341,10 @@ class SummarizationModel(object):
     """Sets self._train_op, the op to run for training."""
     # Take gradients of the trainable variables w.r.t. the loss function to minimize
     loss_to_minimize = self._total_loss if self._hps.coverage else self._loss
+
     tvars = tf.trainable_variables()
+    if self._hps.gan_coeff > 0:
+      tvars = [x for x in tvars if "disc" not in x.name]
     gradients = tf.gradients(loss_to_minimize, tvars, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE)
 
     # Clip the gradients
@@ -313,6 +359,26 @@ class SummarizationModel(object):
     with tf.device("/gpu:0"):
       self._train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=self.global_step, name='train_step')
 
+  def _add_disc_train_op(self):
+    """Sets self._disc_train_op, the op to run for training the discriminator."""
+    # Take gradients of the trainable variables w.r.t. the loss function to minimize
+    loss_to_minimize = self._disc_loss
+
+    tvars = tf.trainable_variables()
+    tvars = [x for x in tvars if "disc" in x.name]
+    gradients = tf.gradients(loss_to_minimize, tvars, aggregation_method=tf.AggregationMethod.EXPERIMENTAL_TREE)
+
+    # Clip the gradients
+    with tf.device("/gpu:0"):
+        grads, global_norm = tf.clip_by_global_norm(gradients, self._hps.max_grad_norm / 10)
+
+    # Add a summary
+    tf.summary.scalar('global_norm', global_norm)
+
+    # Apply adagrad optimizer
+    optimizer = tf.train.AdagradOptimizer(self._hps.lr, initial_accumulator_value=self._hps.adagrad_init_acc)
+    with tf.device("/gpu:0"):
+      self._disc_train_op = optimizer.apply_gradients(zip(grads, tvars), global_step=self.global_step, name='disc_train_step')
 
   def build_graph(self):
     """Add the placeholders, model, global step, train_op and summaries to the graph"""
@@ -324,6 +390,8 @@ class SummarizationModel(object):
     self.global_step = tf.Variable(0, name='global_step', trainable=False)
     if self._hps.mode == 'train':
       self._add_train_op()
+      if self._hps.gan_coeff > 0:
+        self._add_disc_train_op()
     self._summaries = tf.summary.merge_all()
     t1 = time.time()
     tf.logging.info('Time to build graph: %i seconds', t1 - t0)
@@ -337,6 +405,9 @@ class SummarizationModel(object):
         'loss': self._loss,
         'global_step': self.global_step,
     }
+    if self._hps.gan_coeff > 0:
+      to_return['disc_train_op'] = self._disc_train_op
+      to_return['disc_loss'] = self._disc_loss
     if self._hps.coverage:
       to_return['coverage_loss'] = self._coverage_loss
     return sess.run(to_return, feed_dict)
