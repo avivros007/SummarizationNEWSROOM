@@ -237,18 +237,30 @@ class SummarizationModel(object):
     """Add the whole sequence-to-sequence model to the graph."""
     hps = self._hps
     vsize = self._vocab.size() # size of the vocabulary
-
+    if hps.untrainable_embedding_path:
+      trainable_vocab_size = hps.trainable_vocab_size
+      untrainable_vocab_size = vsize - hps.trainable_vocab_size
     with tf.variable_scope('seq2seq'):
       # Some initializers
       self.rand_unif_init = tf.random_uniform_initializer(-hps.rand_unif_init_mag, hps.rand_unif_init_mag, seed=123)
       self.trunc_norm_init = tf.truncated_normal_initializer(stddev=hps.trunc_norm_init_std)
+      if hps.untrainable_embedding_path:
+        self.constant_init_emb = tf.constant_initializer(np.load(hps.untrainable_embedding_path)['embedding'][:untrainable_vocab_size,:])# should be hps.untrainable_embedding_path
+
 
       # Add embedding matrix (shared by the encoder and decoder inputs)
       with tf.variable_scope('embedding'):
-        embedding = tf.get_variable('embedding', [vsize, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+        if hps.untrainable_embedding_path:
+          train_embedding = tf.get_variable('embedding', [trainable_vocab_size, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init, trainable=True)
+          untrain_embedding = tf.get_variable('embedding_untrain', [untrainable_vocab_size, hps.emb_dim], dtype=tf.float32, initializer=self.constant_init_emb,trainable=False) 
+          embedding = tf.concat([train_embedding,untrain_embedding], axis=0)
+
+        else:
+          embedding = tf.get_variable('embedding', [vsize, hps.emb_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
         if hps.mode=="train": self._add_emb_vis(embedding) # add to tensorboard
         emb_enc_inputs = tf.nn.embedding_lookup(embedding, self._enc_batch) # tensor with shape (batch_size, max_enc_steps, emb_size)
         emb_dec_inputs = [tf.nn.embedding_lookup(embedding, x) for x in tf.unstack(self._dec_batch, axis=1)] # list length max_dec_steps containing shape (batch_size, emb_size)
+      assert(embedding.get_shape()[0] == vsize)
 
       # Add the encoder.
       enc_outputs, fw_st, bw_st = self._add_encoder(emb_enc_inputs, self._enc_lens)

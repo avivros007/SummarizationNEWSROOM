@@ -87,9 +87,12 @@ class SizePredictionModel(object):
     hidden_dim = self._hps.hidden_dim
     with tf.variable_scope('Sdense'):
       old_h = tf.concat(axis=1, values=[fw_st.h, bw_st.h]) # Concatenation of fw and bw state
-      weights = tf.get_variable('weights', [2 * hidden_dim, 1], dtype=tf.float32, initializer=self.trunc_norm_init)
-      biases = tf.get_variable('biases', [1], dtype=tf.float32, initializer=self.trunc_norm_init)
-    return tf.matmul(old_h, weights) + biases
+      weights1 = tf.get_variable('weights1', [2 * hidden_dim, hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      biases1 = tf.get_variable('biases1', [hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      weights2 = tf.get_variable('weights2', [hidden_dim, 1], dtype=tf.float32, initializer=self.trunc_norm_init)
+      biases2 = tf.get_variable('biases2', [1], dtype=tf.float32, initializer=self.trunc_norm_init)
+    output = tf.nn.relu(tf.matmul(old_h, weights1) + biases1)
+    return tf.matmul(output, weights2) + biases2
 
   def _add_emb_vis(self, embedding_var):
     """Do setup so that we can view word embedding visualization in Tensorboard, as described here:
@@ -104,6 +107,32 @@ class SizePredictionModel(object):
     embedding.tensor_name = embedding_var.name
     embedding.metadata_path = vocab_metadata_path
     projector.visualize_embeddings(summary_writer, config)
+
+  def _reduce_states(self, fw_st, bw_st):
+    """Add to the graph a linear layer to reduce the encoder's final FW and BW state into a single initial state for the decoder. This is needed because the encoder is bidirectional but the decoder is not.
+
+    Args:
+      fw_st: LSTMStateTuple with hidden_dim units.
+      bw_st: LSTMStateTuple with hidden_dim units.
+
+    Returns:
+      state: LSTMStateTuple with hidden_dim units.
+    """
+    hidden_dim = self._hps.hidden_dim
+    with tf.variable_scope('Sreduce_final_st'):
+
+      # Define weights and biases to reduce the cell and reduce the state
+      w_reduce_c = tf.get_variable('w_reduce_c', [hidden_dim * 2, hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      w_reduce_h = tf.get_variable('w_reduce_h', [hidden_dim * 2, hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      bias_reduce_c = tf.get_variable('bias_reduce_c', [hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+      bias_reduce_h = tf.get_variable('bias_reduce_h', [hidden_dim], dtype=tf.float32, initializer=self.trunc_norm_init)
+
+      # Apply linear layer
+      old_c = tf.concat(axis=1, values=[fw_st.c, bw_st.c]) # Concatenation of fw and bw cell
+      old_h = tf.concat(axis=1, values=[fw_st.h, bw_st.h]) # Concatenation of fw and bw state
+      new_c = tf.nn.relu(tf.matmul(old_c, w_reduce_c) + bias_reduce_c) # Get new cell from old cell
+      new_h = tf.nn.relu(tf.matmul(old_h, w_reduce_h) + bias_reduce_h) # Get new state from old state
+      return tf.contrib.rnn.LSTMStateTuple(new_c, new_h) # Return new cell and state
 
   def _add_seq2seq(self):
     """Add the whole sequence-to-sequence model to the graph."""
@@ -124,6 +153,7 @@ class SizePredictionModel(object):
       # Add the encoder.
       enc_outputs, fw_st, bw_st = self._add_encoder(emb_enc_inputs, self._enc_lens)
       self._enc_states = enc_outputs
+      self._dec_in_state = self._reduce_states(fw_st, bw_st)
       self._pred_output = self._add_dense(fw_st, bw_st)
 
       if hps.mode in ['train', 'eval']:
@@ -194,3 +224,102 @@ class SizePredictionModel(object):
         'preds': self._pred_output,
     }
     return sess.run(to_return, feed_dict)
+
+
+  def run_encoder(self, sess, batch):
+    """For beam search decoding. Run the encoder on the batch and return the encoder states and decoder initial state.
+
+    Args:
+      sess: Tensorflow session.
+      batch: Batch object that is the same example repeated across the batch (for beam search)
+
+    Returns:
+      enc_states: The encoder states. A tensor of shape [batch_size, <=max_enc_steps, 2*hidden_dim].
+      dec_in_state: A LSTMStateTuple of shape ([1,hidden_dim],[1,hidden_dim])
+    """
+    feed_dict = self._make_feed_dict(batch, just_enc=True) # feed the batch into the placeholders
+    (enc_states, dec_in_state, global_step) = sess.run([self._enc_states, self._dec_in_state, self.global_step], feed_dict) # run the encoder
+
+    # dec_in_state is LSTMStateTuple shape ([batch_size,hidden_dim],[batch_size,hidden_dim])
+    # Given that the batch is a single example repeated, dec_in_state is identical across the batch so we just take the top row.
+    dec_in_state = tf.contrib.rnn.LSTMStateTuple(dec_in_state.c[0], dec_in_state.h[0])
+    return enc_states, dec_in_state
+
+
+  def decode_onestep(self, sess, batch, latest_tokens, enc_states, dec_init_states, prev_coverage):
+    """For beam search decoding. Run the decoder for one step.
+
+    Args:
+      sess: Tensorflow session.
+      batch: Batch object containing single example repeated across the batch
+      latest_tokens: Tokens to be fed as input into the decoder for this timestep
+      enc_states: The encoder states.
+      dec_init_states: List of beam_size LSTMStateTuples; the decoder states from the previous timestep
+      prev_coverage: List of np arrays. The coverage vectors from the previous timestep. List of None if not using coverage.
+
+    Returns:
+      ids: top 2k ids. shape [beam_size, 2*beam_size]
+      probs: top 2k log probabilities. shape [beam_size, 2*beam_size]
+      new_states: new states of the decoder. a list length beam_size containing
+        LSTMStateTuples each of shape ([hidden_dim,],[hidden_dim,])
+      attn_dists: List length beam_size containing lists length attn_length.
+      p_gens: Generation probabilities for this step. A list length beam_size. List of None if in baseline mode.
+      new_coverage: Coverage vectors for this step. A list of arrays. List of None if coverage is not turned on.
+    """
+
+    beam_size = len(dec_init_states)
+
+    # Turn dec_init_states (a list of LSTMStateTuples) into a single LSTMStateTuple for the batch
+    cells = [np.expand_dims(state.c, axis=0) for state in dec_init_states]
+    hiddens = [np.expand_dims(state.h, axis=0) for state in dec_init_states]
+    new_c = np.concatenate(cells, axis=0)  # shape [batch_size,hidden_dim]
+    new_h = np.concatenate(hiddens, axis=0)  # shape [batch_size,hidden_dim]
+    new_dec_in_state = tf.contrib.rnn.LSTMStateTuple(new_c, new_h)
+
+    feed = {
+        self._enc_states: enc_states,
+        self._enc_padding_mask: batch.enc_padding_mask,
+        self._dec_in_state: new_dec_in_state,
+        self._dec_batch: np.transpose(np.array([latest_tokens])),
+    }
+
+    to_return = {
+      "ids": self._topk_ids,
+      "probs": self._topk_log_probs,
+      "states": self._dec_out_state,
+      "attn_dists": self.attn_dists
+    }
+
+    if FLAGS.pointer_gen:
+      feed[self._enc_batch_extend_vocab] = batch.enc_batch_extend_vocab
+      feed[self._max_art_oovs] = batch.max_art_oovs
+      to_return['p_gens'] = self.p_gens
+
+    if self._hps.coverage:
+      feed[self.prev_coverage] = np.stack(prev_coverage, axis=0)
+      to_return['coverage'] = self.coverage
+
+    results = sess.run(to_return, feed_dict=feed) # run the decoder step
+
+    # Convert results['states'] (a single LSTMStateTuple) into a list of LSTMStateTuple -- one for each hypothesis
+    new_states = [tf.contrib.rnn.LSTMStateTuple(results['states'].c[i, :], results['states'].h[i, :]) for i in range(beam_size)]
+
+    # Convert singleton list containing a tensor to a list of k arrays
+    assert len(results['attn_dists'])==1
+    attn_dists = results['attn_dists'][0].tolist()
+
+    if FLAGS.pointer_gen:
+      # Convert singleton list containing a tensor to a list of k arrays
+      assert len(results['p_gens'])==1
+      p_gens = results['p_gens'][0].tolist()
+    else:
+      p_gens = [None for _ in range(beam_size)]
+
+    # Convert the coverage tensor to a list length k containing the coverage vector for each hypothesis
+    if FLAGS.coverage:
+      new_coverage = results['coverage'].tolist()
+      assert len(new_coverage) == beam_size
+    else:
+      new_coverage = [None for _ in range(beam_size)]
+
+    return results['ids'], results['probs'], new_states, attn_dists, p_gens, new_coverage

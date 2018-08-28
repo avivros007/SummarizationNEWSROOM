@@ -38,7 +38,7 @@ STOP_DECODING = '[STOP]' # This has a vocab id, which is used at the end of untr
 class Vocab(object):
   """Vocabulary class for mapping between words and ids (integers)"""
 
-  def __init__(self, vocab_file, max_size):
+  def __init__(self, vocab_file, max_size, untrain_path, train_voc_size):
     """Creates a vocab of up to max_size words, reading from the vocab_file. If max_size is 0, reads the entire vocab file.
 
     Args:
@@ -55,23 +55,61 @@ class Vocab(object):
       self._count += 1
 
     # Read the vocab file and add words up to max_size
-    with open(vocab_file, 'r') as vocab_f:
-      for line in vocab_f:
-        pieces = line.split()
-        if len(pieces) != 2:
-          print('Warning: incorrectly formatted line in vocabulary file: %s\n' % line)
-          continue
-        w = pieces[0]
-        if w in [SENTENCE_START, SENTENCE_END, UNKNOWN_TOKEN, PAD_TOKEN, START_DECODING, STOP_DECODING]:
-          raise Exception('<s>, </s>, [UNK], [PAD], [START] and [STOP] shouldn\'t be in the vocab file, but %s is' % w)
-        if w in self._word_to_id:
-          raise Exception('Duplicated word in vocabulary file: %s' % w)
-        self._word_to_id[w] = self._count
-        self._id_to_word[self._count] = w
-        self._count += 1
-        if max_size != 0 and self._count >= max_size:
-          print("max_size of vocab was specified as %i; we now have %i words. Stopping reading." % (max_size, self._count))
-          break
+    if untrain_path: 
+      with open(vocab_file,'r') as vocab_t:
+        for line in vocab_t:
+          pieces = line.split(' ')
+          if len(pieces) != 2:
+            print('Warning: incorrectly formatted line in vocabulary file: %s\n' % line)
+            continue
+          w = pieces[0]
+          if w in [SENTENCE_START, SENTENCE_END, UNKNOWN_TOKEN, PAD_TOKEN, START_DECODING, STOP_DECODING]:
+            raise Exception('<s>, </s>, [UNK], [PAD], [START] and [STOP] shouldn\'t be in the vocab file, but %s is' % w)
+          if w in self._word_to_id:
+            raise Exception('Duplicated word in vocabulary file: %s' % w)
+          self._word_to_id[w] = self._count
+          self._id_to_word[self._count] = w
+          self._count += 1
+          if max_size != 0 and self._count >= train_voc_size:
+            print("max size of trainable vocab was specified as %i; we now have %i words. Stopping reading." % (max_size, self._count))
+            break
+
+      with open(untrain_path,'r') as vocab_u:
+        for line in vocab_u:
+          pieces = line.split(' ')
+          if len(pieces) != 2:
+            print('Warning: incorrectly formatted line in vocabulary file: %s\n' % line)
+            continue
+          w = pieces[0]
+          if w in [SENTENCE_START, SENTENCE_END, UNKNOWN_TOKEN, PAD_TOKEN, START_DECODING, STOP_DECODING]:
+            raise Exception('<s>, </s>, [UNK], [PAD], [START] and [STOP] shouldn\'t be in the vocab file, but %s is' % w)
+          if w in self._word_to_id:
+            raise Exception('Duplicated word in vocabulary file: %s' % w)
+          self._word_to_id[w] = self._count
+          self._id_to_word[self._count] = w
+          self._count += 1
+          if max_size != 0 and self._count >= max_size:
+            print("max total size of vocab was specified as %i; we now have %i words. Stopping reading." % (max_size, self._count))
+            break
+    else:  
+      # Read the vocab file and add words up to max_size
+      with open(vocab_file, 'r') as vocab_f:
+        for line in vocab_f:
+          pieces = line.split(' ')
+          if len(pieces) != 2:
+            print('Warning: incorrectly formatted line in vocabulary file: %s\n' % line)
+            continue
+          w = pieces[0]
+          if w in [SENTENCE_START, SENTENCE_END, UNKNOWN_TOKEN, PAD_TOKEN, START_DECODING, STOP_DECODING]:
+            raise Exception('<s>, </s>, [UNK], [PAD], [START] and [STOP] shouldn\'t be in the vocab file, but %s is' % w)
+          if w in self._word_to_id:
+            raise Exception('Duplicated word in vocabulary file: %s' % w)
+          self._word_to_id[w] = self._count
+          self._id_to_word[self._count] = w
+          self._count += 1
+          if max_size != 0 and self._count >= max_size:
+            print("max_size of vocab was specified as %i; we now have %i words. Stopping reading." % (max_size, self._count))
+            break
 
     print("Finished constructing vocabulary of %i total words. Last word added: %s" % (self._count, self._id_to_word[self._count-1]))
 
