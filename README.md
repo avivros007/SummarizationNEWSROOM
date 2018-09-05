@@ -4,12 +4,11 @@
 
 ## About this code
 The code is based on the [pointer-generator code](https://github.com/abisee/pointer-generator) from Abigail See. It adds a few new features to the original Pointer-Generator Architecture, and evaluates their performance on the NEWSROOM dataset.
-The features are:
+These are the features and they are available using the suitable flags.
 1. Length Prediction - predict summary length with a pretrained model and crop generated summary according to predicted length.
 2. GAN Regularization - use a discriminator network to make generated summaries resemble reference summaries.
 3. Stacked Encoder - use an encoder of a few layers.
 4. Pretrained Word Embeddings - use pretrained word embeddings instead of trainable embeddings.
-All the features are available using the suitable flags.
 
 This code is in Python 2.
 
